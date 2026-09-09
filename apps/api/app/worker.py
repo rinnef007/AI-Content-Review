@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.ai_provider import transcribe_audio
 from app.database import SessionLocal
 from app.job_queue import process_jobs
 from app.knowledge import persist_analysis
@@ -22,13 +23,28 @@ def handle(payload: dict) -> dict:
         metadata = probe_media(str(path))
         audio_path = path.with_suffix(".wav")
         extract_audio(str(path), str(audio_path))
-        return {
-            "media_type": media_type,
-            "filename": payload.get("filename", path.name),
-            "metadata": metadata,
-            "audio_path": str(audio_path),
-            "transcription_status": "ready_for_stt",
-        }
+        transcript = transcribe_audio(str(audio_path))
+        content = transcript.get("text", "").strip()
+        if not content:
+            raise ValueError("STT không nhận diện được lời thoại trong media")
+
+        request = AnalyzeRequest(title=payload["title"], content=content, mode="review", spoiler=False)
+        result = analyze_content(request)
+        result["media"] = {"type": media_type, "filename": payload.get("filename"), "metadata": metadata}
+        result["transcript"] = transcript
+
+        db = SessionLocal()
+        try:
+            episode = db.get(Episode, payload["episode_id"])
+            if not episode or episode.project_id != payload["project_id"]:
+                raise ValueError("Episode not found")
+            episode.content = content
+            episode.analysis = result
+            persisted = persist_analysis(db, payload["project_id"], episode, result)
+            db.commit()
+            return {"episode_id": episode.id, "analysis": result, "persisted": persisted}
+        finally:
+            db.close()
 
     if file_path:
         path = Path(file_path)
