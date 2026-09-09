@@ -4,12 +4,13 @@ AI-assisted content analysis, summarization, and review-script generation for us
 
 ## V1 scope
 
-- Project and episode management
 - Text/Markdown input
 - PDF and image upload
 - OCR for Vietnamese + English images and scanned PDFs
-- Structured content analysis
-- Summary and review-script generation
+- Local deterministic analysis for offline development
+- Optional OpenAI analysis provider
+- Summary, review, and script modes
+- Structured character/event/relationship/conflict fields from the AI provider
 - Job/status model ready for asynchronous workers
 - PostgreSQL-ready persistence
 - Docker Compose development environment
@@ -26,10 +27,28 @@ docker compose up --build
 
 API: http://localhost:8000 · Docs: http://localhost:8000/docs · Web: http://localhost:3000
 
-## Upload API
+## PDF / image OCR
 
 `POST /api/v1/analyze/upload` accepts multipart form data with `file`, optional `title`, `mode` (`summary|review|script`) and `spoiler`.
 
 Supported files: PDF, PNG, JPG/JPEG, WEBP, BMP, TIFF. Text PDFs are extracted directly; scanned/image-only PDFs are rendered page-by-page and OCR'd with Tesseract. V1 limits uploads to 25 MB and 30 PDF pages.
 
-The current analysis provider is local/deterministic for end-to-end testing. A real AI provider can replace `local_analyze()` without changing the upload contract.
+The Docker image installs Tesseract with English and Vietnamese language packs.
+
+## AI provider
+
+Default development mode is local and does not require an API key:
+
+```env
+AI_PROVIDER=local
+```
+
+To enable the OpenAI provider:
+
+```env
+AI_PROVIDER=openai
+AI_API_KEY=your_api_key
+AI_MODEL=gpt-5.6-luna
+```
+
+The backend keeps the same upload contract and sends OCR/text content to the configured provider. The provider returns summary, review, keywords, characters, events, relationships, conflicts, and key details.
