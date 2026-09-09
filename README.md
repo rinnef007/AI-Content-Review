@@ -17,28 +17,6 @@ AI-assisted content analysis, summarization, and review-script generation for us
 
 > Only process content you own or are authorized to process. URL ingestion, when added, will be limited to publicly accessible/authorized content and will not bypass DRM, paywalls, authentication, or access controls.
 
-## Repository layout
-
-```text
-apps/
-  api/                  FastAPI backend
-  web/                  Next.js frontend
-workers/
-  ai/                   AI processing worker foundation
-  ocr/                  OCR worker foundation
-  transcription/        Speech-to-text worker foundation
-  video/                Video processing worker foundation
-packages/
-  shared/               Shared contracts
-infrastructure/
-  postgres/             Database assets
-  redis/                Queue assets
-  minio/                Object storage assets
-docs/                   Architecture and implementation docs
-compose.yaml
-.env.example
-```
-
 ## Quick start
 
 ```bash
@@ -46,21 +24,12 @@ cp .env.example .env
 docker compose up --build
 ```
 
-API: http://localhost:8000
-API docs: http://localhost:8000/docs
-Web: http://localhost:3000
+API: http://localhost:8000 · Docs: http://localhost:8000/docs · Web: http://localhost:3000
 
 ## Upload API
 
-`POST /api/v1/analyze/upload` accepts `multipart/form-data`:
+`POST /api/v1/analyze/upload` accepts multipart form data with `file`, optional `title`, `mode` (`summary|review|script`) and `spoiler`.
 
-- `file`: PDF, PNG, JPG/JPEG, WEBP, BMP, TIFF
-- `title`: optional title
-- `mode`: `summary`, `review`, or `script`
-- `spoiler`: boolean
+Supported files: PDF, PNG, JPG/JPEG, WEBP, BMP, TIFF. Text PDFs are extracted directly; scanned/image-only PDFs are rendered page-by-page and OCR'd with Tesseract. V1 limits uploads to 25 MB and 30 PDF pages.
 
-PDFs with a text layer are extracted directly. Scanned/image-only PDFs are rendered page-by-page and OCR'd with Tesseract. V1 limits uploads to 25 MB and 30 PDF pages.
-
-## Current AI behavior
-
-The current analysis provider is intentionally local/deterministic so the complete upload → OCR → analysis flow can be tested without an external API key. The next AI provider layer can replace `local_analyze()` without changing the upload contract.
+The current analysis provider is local/deterministic for end-to-end testing. A real AI provider can replace `local_analyze()` without changing the upload contract.
