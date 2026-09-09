@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import io
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
+import pytesseract
 
-app = FastAPI(title="AI Content Review API", version="0.1.0")
+app = FastAPI(title="AI Content Review API", version="0.2.0")
 
 jobs: dict[str, dict] = {}
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 class AnalyzeRequest(BaseModel):
@@ -21,12 +28,10 @@ class AnalyzeRequest(BaseModel):
 
 def local_analyze(payload: AnalyzeRequest) -> dict:
     words = payload.content.split()
-    sentences = [s.strip() for s in payload.content.replace("!", ".").replace("?", ".").split(".") if s.strip()]
+    sentences = [s.strip() for s in re.split(r"[.!?]+", payload.content) if s.strip()]
     freq = Counter(w.strip(".,!?;:()[]{}\"'").lower() for w in words)
     keywords = [w for w, _ in freq.most_common(8) if len(w) > 3]
-    excerpt = " ".join(sentences[:3])
-    if not excerpt:
-        excerpt = payload.content[:500]
+    excerpt = " ".join(sentences[:3]) or payload.content[:500]
     summary = f"{payload.title}: {excerpt}"
     review = (
         f"Đánh giá nhanh về {payload.title}: nội dung có khoảng {len(words)} từ "
@@ -46,9 +51,53 @@ def local_analyze(payload: AnalyzeRequest) -> dict:
     }
 
 
+def ocr_image(image: Image.Image) -> str:
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    image.thumbnail((3000, 3000))
+    # Vietnamese + English are installed in the API image.
+    return pytesseract.image_to_string(image, lang="vie+eng", config="--psm 6").strip()
+
+
+def extract_pdf(data: bytes) -> tuple[str, int, int]:
+    reader = PdfReader(io.BytesIO(data))
+    pages = len(reader.pages)
+    text_parts: list[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            text_parts.append(text.strip())
+    return "\n\n".join(text_parts), pages, 0
+
+
+def extract_upload(data: bytes, filename: str, content_type: str | None) -> tuple[str, dict]:
+    lower = filename.lower()
+    suffix = "." + lower.rsplit(".", 1)[-1] if "." in lower else ""
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPG, JPEG, WEBP, BMP, TIFF")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
+
+    if suffix == ".pdf":
+        text, pages, _ = extract_pdf(data)
+        if text.strip():
+            return text, {"type": "pdf", "pages": pages, "ocr_used": False}
+        raise HTTPException(
+            status_code=422,
+            detail="PDF không có lớp text. V1 chưa render PDF thành ảnh để OCR; hãy upload ảnh các trang hoặc PDF có text.",
+        )
+
+    try:
+        text = ocr_image(Image.open(io.BytesIO(data)))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Không thể đọc ảnh: {exc}") from exc
+    if not text:
+        raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong ảnh")
+    return text, {"type": "image", "pages": 1, "ocr_used": True}
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.1.0"}
+    return {"status": "ok", "service": "api", "version": "0.2.0", "ocr": "tesseract"}
 
 
 @app.post("/api/v1/analyze")
@@ -60,6 +109,32 @@ def analyze(payload: AnalyzeRequest) -> dict:
         "status": "completed",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "input": payload.model_dump(),
+        "result": result,
+    }
+    return jobs[job_id]
+
+
+@app.post("/api/v1/analyze/upload")
+def analyze_upload(
+    file: UploadFile = File(...),
+    title: str = Form(default="Tài liệu tải lên"),
+    mode: str = Form(default="review"),
+    spoiler: bool = Form(default=False),
+) -> dict:
+    if mode not in {"summary", "review", "script"}:
+        raise HTTPException(status_code=422, detail="mode phải là summary, review hoặc script")
+    data = file.file.read(MAX_UPLOAD_BYTES + 1)
+    content, source = extract_upload(data, file.filename or "upload", file.content_type)
+    payload = AnalyzeRequest(title=title, content=content, mode=mode, spoiler=spoiler)
+    result = local_analyze(payload)
+    result["source"] = source
+    result["extracted_text"] = content
+    job_id = str(uuid4())
+    jobs[job_id] = {
+        "id": job_id,
+        "status": "completed",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "input": {"title": title, "mode": mode, "spoiler": spoiler, "filename": file.filename},
         "result": result,
     }
     return jobs[job_id]
