@@ -4,20 +4,33 @@ import io
 import os
 import re
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import fitz
 import pytesseract
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.ai_provider import analyze_with_openai
+from app.database import get_db, init_db
+from app.models import Character as CharacterModel
+from app.models import Episode, Event as EventModel, Project
 
-app = FastAPI(title="AI Content Review API", version="0.5.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="AI Content Review API", version="0.6.0", lifespan=lifespan)
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
@@ -63,6 +76,17 @@ class AnalyzeRequest(BaseModel):
     content: str = Field(min_length=1)
     mode: str = Field(default="review", pattern="^(summary|review|script)$")
     spoiler: bool = False
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=300)
+    description: str | None = None
+
+
+class EpisodeCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    content: str | None = None
+    source_type: str = "text"
 
 
 def local_analyze(payload: AnalyzeRequest) -> dict:
@@ -142,9 +166,79 @@ def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
     return text, {"type": "image", "pages": 1, "ocr_used": True}
 
 
+def project_dict(project: Project) -> dict:
+    return {"id": project.id, "name": project.name, "description": project.description, "created_at": project.created_at}
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.5.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
+    return {"status": "ok", "service": "api", "version": "0.6.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
+
+
+@app.get("/api/v1/projects")
+def list_projects(db: Session = Depends(get_db)) -> list[dict]:
+    projects = db.scalars(select(Project).order_by(Project.created_at.desc())).all()
+    return [project_dict(project) for project in projects]
+
+
+@app.post("/api/v1/projects")
+def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> dict:
+    project = Project(name=payload.name, description=payload.description)
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return project_dict(project)
+
+
+@app.get("/api/v1/projects/{project_id}")
+def get_project(project_id: str, db: Session = Depends(get_db)) -> dict:
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {**project_dict(project), "episodes": [{"id": e.id, "title": e.title, "source_type": e.source_type, "created_at": e.created_at} for e in project.episodes],
+            "characters": [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases} for c in project.characters],
+            "events": [{"id": e.id, "title": e.title, "episode_id": e.episode_id, "evidence": e.evidence} for e in project.events]}
+
+
+@app.post("/api/v1/projects/{project_id}/episodes")
+def create_episode(project_id: str, payload: EpisodeCreate, db: Session = Depends(get_db)) -> dict:
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    episode = Episode(project_id=project_id, title=payload.title, content=payload.content, source_type=payload.source_type)
+    db.add(episode)
+    db.commit()
+    db.refresh(episode)
+    return {"id": episode.id, "project_id": episode.project_id, "title": episode.title, "source_type": episode.source_type, "created_at": episode.created_at}
+
+
+@app.post("/api/v1/projects/{project_id}/episodes/{episode_id}/analyze")
+def analyze_episode(project_id: str, episode_id: str, db: Session = Depends(get_db)) -> dict:
+    episode = db.get(Episode, episode_id)
+    if not episode or episode.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    if not episode.content:
+        raise HTTPException(status_code=422, detail="Episode chưa có nội dung")
+    payload = AnalyzeRequest(title=episode.title, content=episode.content, mode="review")
+    result = analyze_content(payload)
+    episode.analysis = result
+
+    existing = {c.name.casefold(): c for c in db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id)).all()}
+    for item in result.get("characters", []):
+        name = item.get("name", "").strip()
+        if not name or name.casefold() in existing:
+            continue
+        character = CharacterModel(project_id=project_id, name=name, role=item.get("role"))
+        db.add(character)
+        existing[name.casefold()] = character
+
+    for item in result.get("events", []):
+        title = item.get("event", "").strip()
+        if title:
+            db.add(EventModel(project_id=project_id, episode_id=episode_id, title=title, evidence=item.get("evidence"), metadata={"characters": item.get("characters", [])}))
+
+    db.commit()
+    return {"episode_id": episode_id, "analysis": result, "persisted": {"characters": len(result.get("characters", [])), "events": len(result.get("events", []))}}
 
 
 @app.post("/api/v1/analyze")
