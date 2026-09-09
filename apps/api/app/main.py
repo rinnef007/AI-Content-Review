@@ -10,13 +10,16 @@ from uuid import uuid4
 import fitz
 import pytesseract
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from app.ai_provider import analyze_with_openai
 
-app = FastAPI(title="AI Content Review API", version="0.4.0")
+app = FastAPI(title="AI Content Review API", version="0.4.1")
+CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -86,7 +89,7 @@ def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.4.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
+    return {"status": "ok", "service": "api", "version": "0.4.1", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
 
 @app.post("/api/v1/analyze")
 def analyze(payload: AnalyzeRequest) -> dict:
