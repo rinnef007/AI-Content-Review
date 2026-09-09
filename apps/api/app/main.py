@@ -11,28 +11,29 @@ from fastapi.responses import PlainTextResponse,Response
 from PIL import Image,ImageOps
 from pydantic import BaseModel,Field
 from pypdf import PdfReader
-from sqlalchemy import select
+from sqlalchemy import func,select
 from sqlalchemy.orm import Session
 from app.ai_provider import analyze_with_openai
 from app.database import get_db,init_db
 from app.exporter import script_html,script_text
 from app.job_queue import enqueue,get_job
 from app.knowledge import build_timeline
-from app.models import Character as CharacterModel,Episode,Event as EventModel,Project,Relationship
-from app.review_script import generate_review_script
+from app.models import Character as CharacterModel,Episode,Event as EventModel,Project,Relationship,ReviewScript
 UPLOAD_DIR=Path(os.getenv("UPLOAD_DIR","/data/uploads"));UPLOAD_DIR.mkdir(parents=True,exist_ok=True)
 @asynccontextmanager
-async def lifespan(_:FastAPI): init_db();UPLOAD_DIR.mkdir(parents=True,exist_ok=True);yield
-app=FastAPI(title="AI Content Review API",version="1.3.0",lifespan=lifespan)
+async def lifespan(_:FastAPI): init_db();yield
+app=FastAPI(title="AI Content Review API",version="1.4.0",lifespan=lifespan)
 CORS_ORIGINS=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:3000").split(",") if x.strip()];app.add_middleware(CORSMiddleware,allow_origins=CORS_ORIGINS,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 DOCUMENT_EXTENSIONS={".pdf",".png",".jpg",".jpeg",".webp",".bmp",".tiff"};MEDIA_EXTENSIONS={".mp4",".mov",".mkv",".webm",".avi",".m4v",".mp3",".wav",".m4a",".aac",".flac",".ogg"};MAX_UPLOAD_BYTES=25*1024*1024;MAX_MEDIA_BYTES=1024*1024*1024;MAX_PDF_PAGES=30;AI_PROVIDER=os.getenv("AI_PROVIDER","local").strip().lower()
 class Character(BaseModel):name:str;role:str|None=None;evidence:str|None=None
 class Event(BaseModel):event:str;characters:list[str]=Field(default_factory=list);evidence:str|None=None
-class Relationship(BaseModel):from_:str=Field(alias="from");to:str;relation:str;evidence:str|None=None;model_config={"populate_by_name":True}
-class StructuredAnalysis(BaseModel):summary:str;review:str;keywords:list[str]=Field(default_factory=list);characters:list[Character]=Field(default_factory=list);events:list[Event]=Field(default_factory=list);relationships:list[Relationship]=Field(default_factory=list);conflicts:list[str]=Field(default_factory=list);key_details:list[str]=Field(default_factory=list)
+class RelationshipPayload(BaseModel):from_:str=Field(alias="from");to:str;relation:str;evidence:str|None=None;model_config={"populate_by_name":True}
+class StructuredAnalysis(BaseModel):summary:str;review:str;keywords:list[str]=Field(default_factory=list);characters:list[Character]=Field(default_factory=list);events:list[Event]=Field(default_factory=list);relationships:list[RelationshipPayload]=Field(default_factory=list);conflicts:list[str]=Field(default_factory=list);key_details:list[str]=Field(default_factory=list)
 class AnalyzeRequest(BaseModel):title:str=Field(min_length=1,max_length=300);content:str=Field(min_length=1);mode:str=Field(default="review",pattern="^(summary|review|script)$");spoiler:bool=False
 class ProjectCreate(BaseModel):name:str=Field(min_length=1,max_length=300);description:str|None=None
 class EpisodeCreate(BaseModel):title:str=Field(min_length=1,max_length=300);content:str|None=None;source_type:str="text"
+class ReviewScriptUpdate(BaseModel):hook:str|None=None;intro:str|None=None;segments:list[dict]=Field(default_factory=list);outro:str|None=None
+
 def local_analyze(p):
  words=p.content.split();sentences=[s.strip() for s in re.split(r"[.!?]+",p.content) if s.strip()];freq=Counter(w.strip(".,!?;:()[]{}\"'").lower() for w in words);keywords=[w for w,_ in freq.most_common(8) if len(w)>3];summary=f"{p.title}: {' '.join(sentences[:3]) or p.content[:500]}";review=f"Đánh giá nhanh về {p.title}: nội dung có khoảng {len(words)} từ và {len(sentences)} câu. Các từ khóa nổi bật: {', '.join(keywords) or 'chưa xác định'}.";return {**StructuredAnalysis(summary=summary,review=review,keywords=keywords).model_dump(by_alias=True),"provider":"local","spoiler":p.spoiler,"stats":{"words":len(words),"sentences":len(sentences)}}
 def analyze_content(p):
@@ -48,20 +49,14 @@ def extract_pdf(data):
  doc=fitz.open(stream=data,filetype="pdf")
  try:return "\n\n".join(f"[Trang {i+1}]\n{ocr_image(Image.open(io.BytesIO(page.get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False).tobytes('png'))))}" for i,page in enumerate(doc)),pages,True
  finally:doc.close()
-def extract_upload(data,filename):
- suffix=Path(filename).suffix.lower()
- if suffix not in DOCUMENT_EXTENSIONS:raise ValueError("Chỉ hỗ trợ PDF, JPEG, PNG, WEBP, BMP, TIFF")
- if len(data)>MAX_UPLOAD_BYTES:raise ValueError("File vượt quá giới hạn 25 MB")
- if suffix==".pdf":
-  text,pages,ocr_used=extract_pdf(data);return text,{"type":"pdf","pages":pages,"ocr_used":ocr_used}
- text=ocr_image(Image.open(io.BytesIO(data)));return text,{"type":"image","pages":1,"ocr_used":True}
-def project_dict(p):return {"id":p.id,"name":p.name,"description":p.description,"created_at":p.created_at}
 def save_upload(file,limit):
  filename=Path(file.filename or "upload").name;data=file.file.read(limit+1)
  if len(data)>limit:raise HTTPException(status_code=413,detail=f"File vượt quá giới hạn {limit//(1024*1024)} MB")
  target=UPLOAD_DIR/f"{uuid4().hex}{Path(filename).suffix.lower()}";target.write_bytes(data);return str(target),filename,len(data)
+def project_dict(p):return {"id":p.id,"name":p.name,"description":p.description,"created_at":p.created_at}
+def script_dict(s):return {"id":s.id,"episode_id":s.episode_id,"version":s.version,"style":s.style,"title":s.title,"hook":s.hook,"intro":s.intro,"segments":s.segments,"outro":s.outro,"provider":s.provider,"model":s.model,"status":s.status,"created_at":s.created_at,"updated_at":s.updated_at}
 @app.get("/health")
-def health():return {"status":"ok","service":"api","version":"1.3.0","ocr":"tesseract","ai_provider":AI_PROVIDER,"queue":"redis","media":"ffmpeg","srt":True,"review_script":True,"export":True}
+def health():return {"status":"ok","service":"api","version":"1.4.0","ocr":"tesseract","ai_provider":AI_PROVIDER,"queue":"redis","media":"ffmpeg","srt":True,"review_script":True,"export":True,"review_script_versions":True}
 @app.get("/api/v1/projects")
 def list_projects(db:Session=Depends(get_db)):return [project_dict(p) for p in db.scalars(select(Project).order_by(Project.created_at.desc())).all()]
 @app.post("/api/v1/projects")
@@ -95,9 +90,8 @@ def analyze_episode(project_id:str,episode_id:str,db:Session=Depends(get_db)):
  return {"job":enqueue({"kind":"episode_analysis","project_id":project_id,"episode_id":episode_id,"title":e.title,"content":e.content,"mode":"review","spoiler":False}),"episode_id":episode_id}
 @app.post("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script")
 def create_review_script(project_id:str,episode_id:str,style:str=Form(default="youtube"),db:Session=Depends(get_db)):
- e=db.get(Episode,episode_id)
+ e=db.get(Episode,episode_id);t=(e.analysis or {}).get("transcript") if e else None
  if not e or e.project_id!=project_id:raise HTTPException(404,"Episode not found")
- t=(e.analysis or {}).get("transcript")
  if not t or not t.get("segments"):raise HTTPException(422,"Episode chưa có timestamp transcript")
  return {"job":enqueue({"kind":"review_script","project_id":project_id,"episode_id":episode_id,"title":e.title,"segments":t["segments"],"style":style}),"episode_id":episode_id,"style":style}
 @app.get("/api/v1/jobs/{job_id}")
@@ -114,26 +108,42 @@ def transcript(project_id:str,episode_id:str,db:Session=Depends(get_db)):
  return {"episode_id":episode_id,"title":e.title,"transcript":t,"review_script":(e.analysis or {}).get("review_script")}
 @app.get("/api/v1/projects/{project_id}/episodes/{episode_id}/srt",response_class=PlainTextResponse)
 def srt(project_id:str,episode_id:str,db:Session=Depends(get_db)):
- e=db.get(Episode,episode_id)
- if not e or e.project_id!=project_id:raise HTTPException(404,"Episode not found")
- text=((e.analysis or {}).get("transcript") or {}).get("srt")
+ e=db.get(Episode,episode_id);text=((e.analysis or {}).get("transcript") or {}).get("srt") if e and e.project_id==project_id else None
  if not text:raise HTTPException(404,"SRT chưa có")
  return Response(content=text,media_type="application/x-subrip",headers={"Content-Disposition":f'attachment; filename="{Path(e.title).stem}.srt"'})
 @app.get("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script")
 def get_review_script(project_id:str,episode_id:str,db:Session=Depends(get_db)):
  e=db.get(Episode,episode_id)
  if not e or e.project_id!=project_id:raise HTTPException(404,"Episode not found")
+ latest=db.scalar(select(ReviewScript).where(ReviewScript.episode_id==episode_id).order_by(ReviewScript.version.desc()).limit(1))
+ if latest:return script_dict(latest)
  script=(e.analysis or {}).get("review_script")
  if not script:raise HTTPException(404,"Review Script chưa có")
- return script
+ return {**script,"episode_id":episode_id,"status":"legacy"}
+@app.get("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script/versions")
+def review_script_versions(project_id:str,episode_id:str,db:Session=Depends(get_db)):
+ e=db.get(Episode,episode_id)
+ if not e or e.project_id!=project_id:raise HTTPException(404,"Episode not found")
+ return [script_dict(s) for s in db.scalars(select(ReviewScript).where(ReviewScript.episode_id==episode_id).order_by(ReviewScript.version.desc())).all()]
+@app.put("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script/{script_id}")
+def update_review_script(project_id:str,episode_id:str,script_id:str,payload:ReviewScriptUpdate,db:Session=Depends(get_db)):
+ e=db.get(Episode,episode_id);s=db.get(ReviewScript,script_id)
+ if not e or e.project_id!=project_id or not s or s.episode_id!=episode_id:raise HTTPException(404,"Review Script not found")
+ s.hook=payload.hook;s.intro=payload.intro;s.segments=payload.segments;s.outro=payload.outro;s.status="draft";db.commit();db.refresh(s);return script_dict(s)
+@app.post("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script/{script_id}/approve")
+def approve_review_script(project_id:str,episode_id:str,script_id:str,db:Session=Depends(get_db)):
+ e=db.get(Episode,episode_id);s=db.get(ReviewScript,script_id)
+ if not e or e.project_id!=project_id or not s or s.episode_id!=episode_id:raise HTTPException(404,"Review Script not found")
+ for other in db.scalars(select(ReviewScript).where(ReviewScript.episode_id==episode_id,ReviewScript.id!=script_id)).all(): other.status="archived"
+ s.status="approved";db.commit();db.refresh(s);return script_dict(s)
 @app.get("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script.txt",response_class=PlainTextResponse)
 def export_txt(project_id:str,episode_id:str,db:Session=Depends(get_db)):
- e=db.get(Episode,episode_id);script=(e.analysis or {}).get("review_script") if e and e.project_id==project_id else None
+ e=db.get(Episode,episode_id);s=db.scalar(select(ReviewScript).where(ReviewScript.episode_id==episode_id).order_by(ReviewScript.version.desc()).limit(1)) if e and e.project_id==project_id else None;script=script_dict(s) if s else ((e.analysis or {}).get("review_script") if e else None)
  if not script:raise HTTPException(404,"Review Script chưa có")
  return Response(content=script_text({**script,"title":e.title}),media_type="text/plain; charset=utf-8",headers={"Content-Disposition":f'attachment; filename="{Path(e.title).stem}-review-script.txt"'})
-@app.get("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script.html",response_class=Response)
+@app.get("/api/v1/projects/{project_id}/episodes/{episode_id}/review-script.html")
 def export_html(project_id:str,episode_id:str,db:Session=Depends(get_db)):
- e=db.get(Episode,episode_id);script=(e.analysis or {}).get("review_script") if e and e.project_id==project_id else None
+ e=db.get(Episode,episode_id);s=db.scalar(select(ReviewScript).where(ReviewScript.episode_id==episode_id).order_by(ReviewScript.version.desc()).limit(1)) if e and e.project_id==project_id else None;script=script_dict(s) if s else ((e.analysis or {}).get("review_script") if e else None)
  if not script:raise HTTPException(404,"Review Script chưa có")
  return Response(content=script_html({**script,"title":e.title}),media_type="text/html; charset=utf-8")
 @app.get("/api/v1/projects/{project_id}/characters")
@@ -149,9 +159,7 @@ def relationships(project_id:str,db:Session=Depends(get_db)):
  if not db.get(Project,project_id):raise HTTPException(404,"Project not found")
  rs=db.scalars(select(Relationship).where(Relationship.project_id==project_id)).all();cs={c.id:c.name for c in db.scalars(select(CharacterModel).where(CharacterModel.project_id==project_id)).all()};return [{"id":r.id,"from":cs.get(r.from_character_id,r.from_character_id),"to":cs.get(r.to_character_id,r.to_character_id),"relation":r.relation,"evidence":r.evidence} for r in rs]
 @app.get("/api/v1/projects/{project_id}/timeline")
-def timeline(project_id:str,db:Session=Depends(get_db)):
- if not db.get(Project,project_id):raise HTTPException(404,"Project not found")
- return build_timeline(db,project_id)
+def timeline(project_id:str,db:Session=Depends(get_db)):return build_timeline(db,project_id)
 @app.post("/api/v1/analyze")
 def analyze(p:AnalyzeRequest):return enqueue({"kind":"analysis",**p.model_dump()})
 @app.post("/api/v1/analyze/upload")
