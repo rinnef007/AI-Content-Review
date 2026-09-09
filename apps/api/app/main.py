@@ -20,8 +20,9 @@ from sqlalchemy.orm import Session
 
 from app.ai_provider import analyze_with_openai
 from app.database import get_db, init_db
+from app.knowledge import build_timeline, persist_analysis
 from app.models import Character as CharacterModel
-from app.models import Episode, Event as EventModel, Project
+from app.models import Episode, Event as EventModel, Project, Relationship
 
 
 @asynccontextmanager
@@ -30,7 +31,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="AI Content Review API", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="AI Content Review API", version="0.7.0", lifespan=lifespan)
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
@@ -102,8 +103,7 @@ def local_analyze(payload: AnalyzeRequest) -> dict:
     elif payload.mode == "script":
         review = f"Mở đầu: {summary}\n\nĐiểm chính: {', '.join(keywords) or 'chưa xác định'}.\n\nKết: Đây là phần cần tiếp tục phân tích khi bật AI provider."
     structured = StructuredAnalysis(summary=summary, review=review, keywords=keywords)
-    return {**structured.model_dump(by_alias=True), "provider": "local", "spoiler": payload.spoiler,
-            "stats": {"words": len(words), "sentences": len(sentences)}}
+    return {**structured.model_dump(by_alias=True), "provider": "local", "spoiler": payload.spoiler, "stats": {"words": len(words), "sentences": len(sentences)}}
 
 
 def analyze_content(payload: AnalyzeRequest) -> dict:
@@ -149,7 +149,7 @@ def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
     lower = filename.lower()
     suffix = "." + lower.rsplit(".", 1)[-1] if "." in lower else ""
     if suffix not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPG, JPEG, WEBP, BMP, TIFF")
+        raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
     if suffix == ".pdf":
@@ -172,7 +172,7 @@ def project_dict(project: Project) -> dict:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.6.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
+    return {"status": "ok", "service": "api", "version": "0.7.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
 
 
 @app.get("/api/v1/projects")
@@ -195,15 +195,12 @@ def get_project(project_id: str, db: Session = Depends(get_db)) -> dict:
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    return {**project_dict(project), "episodes": [{"id": e.id, "title": e.title, "source_type": e.source_type, "created_at": e.created_at} for e in project.episodes],
-            "characters": [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases} for c in project.characters],
-            "events": [{"id": e.id, "title": e.title, "episode_id": e.episode_id, "evidence": e.evidence} for e in project.events]}
+    return {**project_dict(project), "episodes": [{"id": e.id, "title": e.title, "source_type": e.source_type, "created_at": e.created_at} for e in project.episodes], "characters": [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases} for c in project.characters], "events": [{"id": e.id, "title": e.title, "episode_id": e.episode_id, "evidence": e.evidence} for e in project.events]}
 
 
 @app.post("/api/v1/projects/{project_id}/episodes")
 def create_episode(project_id: str, payload: EpisodeCreate, db: Session = Depends(get_db)) -> dict:
-    project = db.get(Project, project_id)
-    if not project:
+    if not db.get(Project, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
     episode = Episode(project_id=project_id, title=payload.title, content=payload.content, source_type=payload.source_type)
     db.add(episode)
@@ -219,26 +216,42 @@ def analyze_episode(project_id: str, episode_id: str, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Episode not found")
     if not episode.content:
         raise HTTPException(status_code=422, detail="Episode chưa có nội dung")
-    payload = AnalyzeRequest(title=episode.title, content=episode.content, mode="review")
-    result = analyze_content(payload)
-    episode.analysis = result
-
-    existing = {c.name.casefold(): c for c in db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id)).all()}
-    for item in result.get("characters", []):
-        name = item.get("name", "").strip()
-        if not name or name.casefold() in existing:
-            continue
-        character = CharacterModel(project_id=project_id, name=name, role=item.get("role"))
-        db.add(character)
-        existing[name.casefold()] = character
-
-    for item in result.get("events", []):
-        title = item.get("event", "").strip()
-        if title:
-            db.add(EventModel(project_id=project_id, episode_id=episode_id, title=title, evidence=item.get("evidence"), metadata={"characters": item.get("characters", [])}))
-
+    result = analyze_content(AnalyzeRequest(title=episode.title, content=episode.content, mode="review"))
+    persisted = persist_analysis(db, project_id, episode, result)
     db.commit()
-    return {"episode_id": episode_id, "analysis": result, "persisted": {"characters": len(result.get("characters", [])), "events": len(result.get("events", []))}}
+    return {"episode_id": episode_id, "analysis": result, "persisted": persisted}
+
+
+@app.get("/api/v1/projects/{project_id}/characters")
+def list_characters(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
+    if not db.get(Project, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    characters = db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id).order_by(CharacterModel.name.asc())).all()
+    return [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases, "created_at": c.created_at} for c in characters]
+
+
+@app.get("/api/v1/projects/{project_id}/events")
+def list_events(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
+    if not db.get(Project, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    events = db.scalars(select(EventModel).where(EventModel.project_id == project_id).order_by(EventModel.created_at.asc())).all()
+    return [{"id": e.id, "episode_id": e.episode_id, "title": e.title, "evidence": e.evidence, "metadata": e.metadata, "created_at": e.created_at} for e in events]
+
+
+@app.get("/api/v1/projects/{project_id}/relationships")
+def list_relationships(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
+    if not db.get(Project, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    relationships = db.scalars(select(Relationship).where(Relationship.project_id == project_id)).all()
+    characters = {c.id: c.name for c in db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id)).all()}
+    return [{"id": r.id, "from": characters.get(r.from_character_id, r.from_character_id), "to": characters.get(r.to_character_id, r.to_character_id), "relation": r.relation, "evidence": r.evidence} for r in relationships]
+
+
+@app.get("/api/v1/projects/{project_id}/timeline")
+def project_timeline(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
+    if not db.get(Project, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return build_timeline(db, project_id)
 
 
 @app.post("/api/v1/analyze")
