@@ -59,7 +59,7 @@ class Event(Base):
     episode_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), ForeignKey("episodes.id", ondelete="SET NULL"), index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     evidence: Mapped[str | None] = mapped_column(Text)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    event_metadata: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     project: Mapped[Project] = relationship(back_populates="events")
@@ -74,3 +74,6 @@ class Relationship(Base):
     to_character_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False)
     relation: Mapped[str] = mapped_column(String(300), nullable=False)
     evidence: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    project: Mapped[Project] = relationship()
