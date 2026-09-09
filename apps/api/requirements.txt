@@ -7,3 +7,4 @@ pypdf==6.0.0
 PyMuPDF==1.26.4
 Pillow==11.3.0
 pytesseract==0.3.13
+openai==1.107.2
