@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.ai_provider import analyze_with_openai
 from app.database import get_db, init_db
+from app.job_queue import enqueue, get_job
 from app.knowledge import build_timeline, persist_analysis
 from app.models import Character as CharacterModel
 from app.models import Episode, Event as EventModel, Project, Relationship
@@ -31,7 +32,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="AI Content Review API", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="AI Content Review API", version="0.8.0", lifespan=lifespan)
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
@@ -98,10 +99,8 @@ def local_analyze(payload: AnalyzeRequest) -> dict:
     excerpt = " ".join(sentences[:3]) or payload.content[:500]
     summary = f"{payload.title}: {excerpt}"
     review = f"Đánh giá nhanh về {payload.title}: nội dung có khoảng {len(words)} từ và {len(sentences)} câu. Các từ khóa nổi bật: {', '.join(keywords) or 'chưa xác định'}."
-    if payload.mode == "summary":
-        review = summary
-    elif payload.mode == "script":
-        review = f"Mở đầu: {summary}\n\nĐiểm chính: {', '.join(keywords) or 'chưa xác định'}.\n\nKết: Đây là phần cần tiếp tục phân tích khi bật AI provider."
+    if payload.mode == "summary": review = summary
+    elif payload.mode == "script": review = f"Mở đầu: {summary}\n\nĐiểm chính: {', '.join(keywords) or 'chưa xác định'}.\n\nKết: Đây là phần cần tiếp tục phân tích khi bật AI provider."
     structured = StructuredAnalysis(summary=summary, review=review, keywords=keywords)
     return {**structured.model_dump(by_alias=True), "provider": "local", "spoiler": payload.spoiler, "stats": {"words": len(words), "sentences": len(sentences)}}
 
@@ -128,41 +127,31 @@ def ocr_image(image: Image.Image) -> str:
 def extract_pdf(data: bytes) -> tuple[str, int, bool]:
     reader = PdfReader(io.BytesIO(data))
     pages = len(reader.pages)
-    if pages > MAX_PDF_PAGES:
-        raise HTTPException(status_code=413, detail=f"PDF vượt quá giới hạn {MAX_PDF_PAGES} trang ở V1")
+    if pages > MAX_PDF_PAGES: raise HTTPException(status_code=413, detail=f"PDF vượt quá giới hạn {MAX_PDF_PAGES} trang ở V1")
     text_parts = [(page.extract_text() or "").strip() for page in reader.pages]
     text = "\n\n".join(p for p in text_parts if p)
-    if text:
-        return text, pages, False
+    if text: return text, pages, False
     document = fitz.open(stream=data, filetype="pdf")
     ocr_parts: list[str] = []
     for index, page in enumerate(document):
         pixmap = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False)
-        image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-        page_text = ocr_image(image)
-        if page_text:
-            ocr_parts.append(f"[Trang {index + 1}]\n{page_text}")
+        page_text = ocr_image(Image.open(io.BytesIO(pixmap.tobytes("png"))))
+        if page_text: ocr_parts.append(f"[Trang {index + 1}]\n{page_text}")
     return "\n\n".join(ocr_parts), pages, True
 
 
 def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
     lower = filename.lower()
     suffix = "." + lower.rsplit(".", 1)[-1] if "." in lower else ""
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
+    if suffix not in ALLOWED_EXTENSIONS: raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
+    if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
     if suffix == ".pdf":
         text, pages, ocr_used = extract_pdf(data)
-        if not text:
-            raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong PDF")
+        if not text: raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong PDF")
         return text, {"type": "pdf", "pages": pages, "ocr_used": ocr_used}
-    try:
-        text = ocr_image(Image.open(io.BytesIO(data)))
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Không thể đọc ảnh: {exc}") from exc
-    if not text:
-        raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong ảnh")
+    try: text = ocr_image(Image.open(io.BytesIO(data)))
+    except Exception as exc: raise HTTPException(status_code=422, detail=f"Không thể đọc ảnh: {exc}") from exc
+    if not text: raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong ảnh")
     return text, {"type": "image", "pages": 1, "ocr_used": True}
 
 
@@ -172,76 +161,74 @@ def project_dict(project: Project) -> dict:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.7.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
+    return {"status": "ok", "service": "api", "version": "0.8.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER, "queue": "redis"}
 
 
 @app.get("/api/v1/projects")
 def list_projects(db: Session = Depends(get_db)) -> list[dict]:
-    projects = db.scalars(select(Project).order_by(Project.created_at.desc())).all()
-    return [project_dict(project) for project in projects]
+    return [project_dict(project) for project in db.scalars(select(Project).order_by(Project.created_at.desc())).all()]
 
 
 @app.post("/api/v1/projects")
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> dict:
     project = Project(name=payload.name, description=payload.description)
-    db.add(project)
-    db.commit()
-    db.refresh(project)
+    db.add(project); db.commit(); db.refresh(project)
     return project_dict(project)
 
 
 @app.get("/api/v1/projects/{project_id}")
 def get_project(project_id: str, db: Session = Depends(get_db)) -> dict:
     project = db.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    if not project: raise HTTPException(status_code=404, detail="Project not found")
     return {**project_dict(project), "episodes": [{"id": e.id, "title": e.title, "source_type": e.source_type, "created_at": e.created_at} for e in project.episodes], "characters": [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases} for c in project.characters], "events": [{"id": e.id, "title": e.title, "episode_id": e.episode_id, "evidence": e.evidence} for e in project.events]}
 
 
 @app.post("/api/v1/projects/{project_id}/episodes")
 def create_episode(project_id: str, payload: EpisodeCreate, db: Session = Depends(get_db)) -> dict:
-    if not db.get(Project, project_id):
-        raise HTTPException(status_code=404, detail="Project not found")
+    if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     episode = Episode(project_id=project_id, title=payload.title, content=payload.content, source_type=payload.source_type)
-    db.add(episode)
-    db.commit()
-    db.refresh(episode)
+    db.add(episode); db.commit(); db.refresh(episode)
     return {"id": episode.id, "project_id": episode.project_id, "title": episode.title, "source_type": episode.source_type, "created_at": episode.created_at}
 
 
 @app.post("/api/v1/projects/{project_id}/episodes/{episode_id}/analyze")
 def analyze_episode(project_id: str, episode_id: str, db: Session = Depends(get_db)) -> dict:
     episode = db.get(Episode, episode_id)
-    if not episode or episode.project_id != project_id:
-        raise HTTPException(status_code=404, detail="Episode not found")
-    if not episode.content:
-        raise HTTPException(status_code=422, detail="Episode chưa có nội dung")
-    result = analyze_content(AnalyzeRequest(title=episode.title, content=episode.content, mode="review"))
-    persisted = persist_analysis(db, project_id, episode, result)
-    db.commit()
-    return {"episode_id": episode_id, "analysis": result, "persisted": persisted}
+    if not episode or episode.project_id != project_id: raise HTTPException(status_code=404, detail="Episode not found")
+    if not episode.content: raise HTTPException(status_code=422, detail="Episode chưa có nội dung")
+    job = enqueue({"kind": "episode_analysis", "project_id": project_id, "episode_id": episode_id, "title": episode.title, "content": episode.content, "mode": "review", "spoiler": False})
+    return {"job": job, "episode_id": episode_id}
+
+
+@app.post("/api/v1/jobs")
+def create_analysis_job(payload: AnalyzeRequest) -> dict:
+    return enqueue({"kind": "analysis", **payload.model_dump()})
+
+
+@app.get("/api/v1/jobs/{job_id}")
+def get_analysis_job(job_id: str) -> dict:
+    job = get_job(job_id)
+    if not job: raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.get("/api/v1/projects/{project_id}/characters")
 def list_characters(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
-    if not db.get(Project, project_id):
-        raise HTTPException(status_code=404, detail="Project not found")
+    if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     characters = db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id).order_by(CharacterModel.name.asc())).all()
     return [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases, "created_at": c.created_at} for c in characters]
 
 
 @app.get("/api/v1/projects/{project_id}/events")
 def list_events(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
-    if not db.get(Project, project_id):
-        raise HTTPException(status_code=404, detail="Project not found")
+    if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     events = db.scalars(select(EventModel).where(EventModel.project_id == project_id).order_by(EventModel.created_at.asc())).all()
     return [{"id": e.id, "episode_id": e.episode_id, "title": e.title, "evidence": e.evidence, "metadata": e.event_metadata, "created_at": e.created_at} for e in events]
 
 
 @app.get("/api/v1/projects/{project_id}/relationships")
 def list_relationships(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
-    if not db.get(Project, project_id):
-        raise HTTPException(status_code=404, detail="Project not found")
+    if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     relationships = db.scalars(select(Relationship).where(Relationship.project_id == project_id)).all()
     characters = {c.id: c.name for c in db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id)).all()}
     return [{"id": r.id, "from": characters.get(r.from_character_id, r.from_character_id), "to": characters.get(r.to_character_id, r.to_character_id), "relation": r.relation, "evidence": r.evidence} for r in relationships]
@@ -249,37 +236,26 @@ def list_relationships(project_id: str, db: Session = Depends(get_db)) -> list[d
 
 @app.get("/api/v1/projects/{project_id}/timeline")
 def project_timeline(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
-    if not db.get(Project, project_id):
-        raise HTTPException(status_code=404, detail="Project not found")
+    if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     return build_timeline(db, project_id)
 
 
 @app.post("/api/v1/analyze")
 def analyze(payload: AnalyzeRequest) -> dict:
-    job_id = str(uuid4())
     result = analyze_content(payload)
+    job_id = str(uuid4())
     jobs[job_id] = {"id": job_id, "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "input": payload.model_dump(), "result": result}
     return jobs[job_id]
 
 
 @app.post("/api/v1/analyze/upload")
 def analyze_upload(file: UploadFile = File(...), title: str = Form(default="Tài liệu tải lên"), mode: str = Form(default="review"), spoiler: bool = Form(default=False)) -> dict:
-    if mode not in {"summary", "review", "script"}:
-        raise HTTPException(status_code=422, detail="mode phải là summary, review hoặc script")
+    if mode not in {"summary", "review", "script"}: raise HTTPException(status_code=422, detail="mode phải là summary, review hoặc script")
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     content, source = extract_upload(data, file.filename or "upload")
     payload = AnalyzeRequest(title=title, content=content, mode=mode, spoiler=spoiler)
     result = analyze_content(payload)
-    result["source"] = source
-    result["extracted_text"] = content
+    result["source"] = source; result["extracted_text"] = content
     job_id = str(uuid4())
     jobs[job_id] = {"id": job_id, "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "input": {"title": title, "mode": mode, "spoiler": spoiler, "filename": file.filename}, "result": result}
     return jobs[job_id]
-
-
-@app.get("/api/v1/jobs/{job_id}")
-def get_job(job_id: str) -> dict:
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
