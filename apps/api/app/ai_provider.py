@@ -15,37 +15,37 @@ def analyze_with_openai(*, title: str, content: str, mode: str, spoiler: bool) -
 
     client = OpenAI(api_key=api_key)
     prompt = f"""
-Bạn là biên tập viên nội dung tiếng Việt. Phân tích tài liệu người dùng cung cấp và trả về DUY NHẤT JSON hợp lệ.
-Không bịa chi tiết không có trong nội dung. Nếu thông tin không rõ, ghi null hoặc [] .
+Bạn là biên tập viên nội dung tiếng Việt. Phân tích tài liệu người dùng cung cấp.
+Chỉ sử dụng thông tin có bằng chứng trong nội dung; không tự bịa tên, sự kiện hoặc quan hệ.
+Nếu không xác định được thông tin, trả về [] hoặc null.
+Trả về DUY NHẤT một JSON object hợp lệ, không Markdown.
 
 Tiêu đề: {title}
-Chế độ đầu ra: {mode}
-Spoiler được phép: {spoiler}
+Chế độ: {mode}
+Cho phép spoiler: {spoiler}
 
 Nội dung:
 {content}
 
-JSON bắt buộc có các khóa:
-summary: string
-review: string
-keywords: string[]
-characters: object[] với name, role, evidence
-characters_events: object[] với event, characters, evidence
-relationships: object[] với from, to, relation, evidence
-conflicts: string[]
-key_details: string[]
+Schema JSON bắt buộc:
+{{
+  "summary": "string",
+  "review": "string",
+  "keywords": ["string"],
+  "characters": [{{"name":"string","role":"string|null","evidence":"string|null"}}],
+  "events": [{{"event":"string","characters":["string"],"evidence":"string|null"}}],
+  "relationships": [{{"from":"string","to":"string","relation":"string","evidence":"string|null"}}],
+  "conflicts": ["string"],
+  "key_details": ["string"]
+}}
 """
 
-    response = client.responses.create(
-        model=model,
-        input=prompt,
-    )
+    response = client.responses.create(model=model, input=prompt)
     raw = response.output_text.strip()
     try:
         result = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError("AI provider trả về dữ liệu không phải JSON hợp lệ") from exc
-
     if not isinstance(result, dict):
         raise RuntimeError("AI provider trả về cấu trúc JSON không hợp lệ")
     result["provider"] = "openai"
