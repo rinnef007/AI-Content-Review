@@ -17,9 +17,33 @@ def client() -> OpenAI:
 def transcribe_audio(audio_path: str) -> dict[str, Any]:
     model = os.getenv("STT_MODEL", "gpt-4o-transcribe").strip()
     with open(audio_path, "rb") as audio_file:
-        response = client().audio.transcriptions.create(model=model, file=audio_file, response_format="verbose_json")
+        response = client().audio.transcriptions.create(
+            model=model,
+            file=audio_file,
+            response_format="verbose_json",
+        )
     data = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-    return {"text": data.get("text", ""), "model": model, "provider": "openai", "raw": data}
+    segments = data.get("segments") or []
+    normalized = []
+    for index, segment in enumerate(segments, start=1):
+        if hasattr(segment, "model_dump"):
+            segment = segment.model_dump()
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(segment.get("start") or 0)
+        end = float(segment.get("end") or start)
+        normalized.append({"index": index, "start": start, "end": max(start, end), "text": text})
+    return {
+        "text": data.get("text", ""),
+        "duration": data.get("duration"),
+        "language": data.get("language"),
+        "segments": normalized,
+        "model": model,
+        "provider": "openai",
+    }
 
 
 def analyze_with_openai(*, title: str, content: str, mode: str, spoiler: bool) -> dict[str, Any]:
