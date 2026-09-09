@@ -29,10 +29,13 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/content_review
       REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
       CORS_ORIGINS: http://localhost:3000
       AI_PROVIDER: ${AI_PROVIDER:-local}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_MODEL: ${AI_MODEL:-gpt-5.6-luna}
+    volumes:
+      - uploads_data:/data/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -47,10 +50,13 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/content_review
       REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
       AI_PROVIDER: ${AI_PROVIDER:-local}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_MODEL: ${AI_MODEL:-gpt-5.6-luna}
       JOB_QUEUE_CONSUMER: worker-1
+    volumes:
+      - uploads_data:/data/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -73,3 +79,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  uploads_data:
