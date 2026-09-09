@@ -4,15 +4,31 @@ from pathlib import Path
 
 from app.database import SessionLocal
 from app.job_queue import process_jobs
-from app.job_queue import update_job
 from app.knowledge import persist_analysis
 from app.main import AnalyzeRequest, analyze_content, extract_upload
+from app.media import extract_audio, media_kind, probe_media
 from app.models import Episode
 
 
 def handle(payload: dict) -> dict:
     kind = payload.get("kind", "analysis")
     file_path = payload.get("file_path")
+
+    if kind == "media_episode_analysis":
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Media file not found: {file_path}")
+        media_type = media_kind(payload.get("filename", path.name))
+        metadata = probe_media(str(path))
+        audio_path = path.with_suffix(".wav")
+        extract_audio(str(path), str(audio_path))
+        return {
+            "media_type": media_type,
+            "filename": payload.get("filename", path.name),
+            "metadata": metadata,
+            "audio_path": str(audio_path),
+            "transcription_status": "ready_for_stt",
+        }
 
     if file_path:
         path = Path(file_path)
