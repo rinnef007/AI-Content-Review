@@ -7,7 +7,7 @@ from app.database import SessionLocal
 from app.job_queue import process_jobs
 from app.knowledge import persist_analysis
 from app.main import AnalyzeRequest, analyze_content, extract_upload
-from app.media import extract_audio, media_kind, probe_media
+from app.media import extract_audio, media_kind, probe_media, normalize_segments, transcript_to_srt
 from app.models import Episode
 
 
@@ -28,6 +28,12 @@ def handle(payload: dict) -> dict:
         if not content:
             raise ValueError("STT không nhận diện được lời thoại trong media")
 
+        segments = normalize_segments(transcript)
+        srt = transcript_to_srt(segments)
+        transcript["segments"] = segments
+        transcript["srt"] = srt
+        transcript["segment_count"] = len(segments)
+
         request = AnalyzeRequest(title=payload["title"], content=content, mode="review", spoiler=False)
         result = analyze_content(request)
         result["media"] = {"type": media_type, "filename": payload.get("filename"), "metadata": metadata}
@@ -39,6 +45,8 @@ def handle(payload: dict) -> dict:
             if not episode or episode.project_id != payload["project_id"]:
                 raise ValueError("Episode not found")
             episode.content = content
+            episode.source_filename = payload.get("filename")
+            episode.source_type = media_type
             episode.analysis = result
             persisted = persist_analysis(db, payload["project_id"], episode, result)
             db.commit()
