@@ -6,6 +6,7 @@ import re
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import fitz
@@ -21,21 +22,24 @@ from sqlalchemy.orm import Session
 from app.ai_provider import analyze_with_openai
 from app.database import get_db, init_db
 from app.job_queue import enqueue, get_job
-from app.knowledge import build_timeline, persist_analysis
+from app.knowledge import build_timeline
 from app.models import Character as CharacterModel
 from app.models import Episode, Event as EventModel, Project, Relationship
+
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/data/uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     yield
 
 
-app = FastAPI(title="AI Content Review API", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="AI Content Review API", version="0.9.0", lifespan=lifespan)
 CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-jobs: dict[str, dict] = {}
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 30
@@ -99,8 +103,10 @@ def local_analyze(payload: AnalyzeRequest) -> dict:
     excerpt = " ".join(sentences[:3]) or payload.content[:500]
     summary = f"{payload.title}: {excerpt}"
     review = f"Đánh giá nhanh về {payload.title}: nội dung có khoảng {len(words)} từ và {len(sentences)} câu. Các từ khóa nổi bật: {', '.join(keywords) or 'chưa xác định'}."
-    if payload.mode == "summary": review = summary
-    elif payload.mode == "script": review = f"Mở đầu: {summary}\n\nĐiểm chính: {', '.join(keywords) or 'chưa xác định'}.\n\nKết: Đây là phần cần tiếp tục phân tích khi bật AI provider."
+    if payload.mode == "summary":
+        review = summary
+    elif payload.mode == "script":
+        review = f"Mở đầu: {summary}\n\nĐiểm chính: {', '.join(keywords) or 'chưa xác định'}.\n\nKết: Đây là phần cần tiếp tục phân tích khi bật AI provider."
     structured = StructuredAnalysis(summary=summary, review=review, keywords=keywords)
     return {**structured.model_dump(by_alias=True), "provider": "local", "spoiler": payload.spoiler, "stats": {"words": len(words), "sentences": len(sentences)}}
 
@@ -114,7 +120,7 @@ def analyze_content(payload: AnalyzeRequest) -> dict:
             extras["stats"] = {"words": len(payload.content.split()), "sentences": len([s for s in re.split(r"[.!?]+", payload.content) if s.strip()])}
             return {**structured.model_dump(by_alias=True), **extras}
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"AI provider lỗi: {exc}") from exc
+            raise RuntimeError(f"AI provider lỗi: {exc}") from exc
     return local_analyze(payload)
 
 
@@ -127,31 +133,44 @@ def ocr_image(image: Image.Image) -> str:
 def extract_pdf(data: bytes) -> tuple[str, int, bool]:
     reader = PdfReader(io.BytesIO(data))
     pages = len(reader.pages)
-    if pages > MAX_PDF_PAGES: raise HTTPException(status_code=413, detail=f"PDF vượt quá giới hạn {MAX_PDF_PAGES} trang ở V1")
+    if pages > MAX_PDF_PAGES:
+        raise ValueError(f"PDF vượt quá giới hạn {MAX_PDF_PAGES} trang ở V1")
     text_parts = [(page.extract_text() or "").strip() for page in reader.pages]
     text = "\n\n".join(p for p in text_parts if p)
-    if text: return text, pages, False
+    if text:
+        return text, pages, False
     document = fitz.open(stream=data, filetype="pdf")
-    ocr_parts: list[str] = []
-    for index, page in enumerate(document):
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False)
-        page_text = ocr_image(Image.open(io.BytesIO(pixmap.tobytes("png"))))
-        if page_text: ocr_parts.append(f"[Trang {index + 1}]\n{page_text}")
-    return "\n\n".join(ocr_parts), pages, True
+    try:
+        ocr_parts: list[str] = []
+        for index, page in enumerate(document):
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False)
+            image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+            page_text = ocr_image(image)
+            if page_text:
+                ocr_parts.append(f"[Trang {index + 1}]\n{page_text}")
+        return "\n\n".join(ocr_parts), pages, True
+    finally:
+        document.close()
 
 
 def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
     lower = filename.lower()
     suffix = "." + lower.rsplit(".", 1)[-1] if "." in lower else ""
-    if suffix not in ALLOWED_EXTENSIONS: raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
-    if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise ValueError("Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("File vượt quá giới hạn 25 MB")
     if suffix == ".pdf":
         text, pages, ocr_used = extract_pdf(data)
-        if not text: raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong PDF")
+        if not text:
+            raise ValueError("OCR không nhận diện được văn bản trong PDF")
         return text, {"type": "pdf", "pages": pages, "ocr_used": ocr_used}
-    try: text = ocr_image(Image.open(io.BytesIO(data)))
-    except Exception as exc: raise HTTPException(status_code=422, detail=f"Không thể đọc ảnh: {exc}") from exc
-    if not text: raise HTTPException(status_code=422, detail="OCR không nhận diện được văn bản trong ảnh")
+    try:
+        text = ocr_image(Image.open(io.BytesIO(data)))
+    except Exception as exc:
+        raise ValueError(f"Không thể đọc ảnh: {exc}") from exc
+    if not text:
+        raise ValueError("OCR không nhận diện được văn bản trong ảnh")
     return text, {"type": "image", "pages": 1, "ocr_used": True}
 
 
@@ -161,7 +180,7 @@ def project_dict(project: Project) -> dict:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.8.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER, "queue": "redis"}
+    return {"status": "ok", "service": "api", "version": "0.9.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER, "queue": "redis"}
 
 
 @app.get("/api/v1/projects")
@@ -180,7 +199,7 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> dic
 def get_project(project_id: str, db: Session = Depends(get_db)) -> dict:
     project = db.get(Project, project_id)
     if not project: raise HTTPException(status_code=404, detail="Project not found")
-    return {**project_dict(project), "episodes": [{"id": e.id, "title": e.title, "source_type": e.source_type, "created_at": e.created_at} for e in project.episodes], "characters": [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases} for c in project.characters], "events": [{"id": e.id, "title": e.title, "episode_id": e.episode_id, "evidence": e.evidence} for e in project.events]}
+    return {**project_dict(project), "episodes": [{"id": e.id, "title": e.title, "source_type": e.source_type, "source_filename": e.source_filename, "created_at": e.created_at} for e in project.episodes], "characters": [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases} for c in project.characters], "events": [{"id": e.id, "title": e.title, "episode_id": e.episode_id, "evidence": e.evidence} for e in project.events]}
 
 
 @app.post("/api/v1/projects/{project_id}/episodes")
@@ -189,6 +208,32 @@ def create_episode(project_id: str, payload: EpisodeCreate, db: Session = Depend
     episode = Episode(project_id=project_id, title=payload.title, content=payload.content, source_type=payload.source_type)
     db.add(episode); db.commit(); db.refresh(episode)
     return {"id": episode.id, "project_id": episode.project_id, "title": episode.title, "source_type": episode.source_type, "created_at": episode.created_at}
+
+
+@app.post("/api/v1/projects/{project_id}/episodes/upload")
+def upload_episode(project_id: str, file: UploadFile = File(...), title: str | None = Form(default=None)) -> dict:
+    if not get_db:  # pragma: no cover
+        raise HTTPException(status_code=500, detail="Database unavailable")
+    db = next(get_db())
+    try:
+        if not db.get(Project, project_id):
+            raise HTTPException(status_code=404, detail="Project not found")
+        filename = Path(file.filename or "upload").name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
+        data = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
+        stored_name = f"{uuid4().hex}{suffix}"
+        target = UPLOAD_DIR / stored_name
+        target.write_bytes(data)
+        episode = Episode(project_id=project_id, title=title or Path(filename).stem, source_type="file", source_filename=filename)
+        db.add(episode); db.commit(); db.refresh(episode)
+        job = enqueue({"kind": "upload_episode_analysis", "project_id": project_id, "episode_id": episode.id, "file_path": str(target), "filename": filename, "title": episode.title, "mode": "review", "spoiler": False})
+        return {"episode": {"id": episode.id, "project_id": project_id, "title": episode.title, "source_type": episode.source_type, "source_filename": filename}, "job": job}
+    finally:
+        db.close()
 
 
 @app.post("/api/v1/projects/{project_id}/episodes/{episode_id}/analyze")
@@ -242,20 +287,17 @@ def project_timeline(project_id: str, db: Session = Depends(get_db)) -> list[dic
 
 @app.post("/api/v1/analyze")
 def analyze(payload: AnalyzeRequest) -> dict:
-    result = analyze_content(payload)
-    job_id = str(uuid4())
-    jobs[job_id] = {"id": job_id, "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "input": payload.model_dump(), "result": result}
-    return jobs[job_id]
+    return enqueue({"kind": "analysis", **payload.model_dump()})
 
 
 @app.post("/api/v1/analyze/upload")
 def analyze_upload(file: UploadFile = File(...), title: str = Form(default="Tài liệu tải lên"), mode: str = Form(default="review"), spoiler: bool = Form(default=False)) -> dict:
     if mode not in {"summary", "review", "script"}: raise HTTPException(status_code=422, detail="mode phải là summary, review hoặc script")
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
-    content, source = extract_upload(data, file.filename or "upload")
-    payload = AnalyzeRequest(title=title, content=content, mode=mode, spoiler=spoiler)
-    result = analyze_content(payload)
-    result["source"] = source; result["extracted_text"] = content
-    job_id = str(uuid4())
-    jobs[job_id] = {"id": job_id, "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "input": {"title": title, "mode": mode, "spoiler": spoiler, "filename": file.filename}, "result": result}
-    return jobs[job_id]
+    if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
+    filename = Path(file.filename or "upload").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS: raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
+    target = UPLOAD_DIR / f"{uuid4().hex}{suffix}"
+    target.write_bytes(data)
+    return enqueue({"kind": "upload_analysis", "file_path": str(target), "filename": filename, "title": title, "mode": mode, "spoiler": spoiler})
