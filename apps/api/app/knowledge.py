@@ -57,16 +57,17 @@ def persist_analysis(db: Session, project_id: str, episode: Episode, result: dic
         title = str(item.get("event", "")).strip()
         if not title:
             continue
-        db.add(Event(project_id=project_id, episode_id=episode.id, title=title, evidence=item.get("evidence"), metadata={"characters": item.get("characters", [])}))
+        db.add(Event(project_id=project_id, episode_id=episode.id, title=title, evidence=item.get("evidence"), event_metadata={"characters": item.get("characters", [])}))
         created_events += 1
 
     created_relationships = 0
     for item in result.get("relationships", []):
         source = by_name.get(normalize_name(str(item.get("from", ""))))
         target = by_name.get(normalize_name(str(item.get("to", ""))))
-        if not source or not target:
+        relation = str(item.get("relation", "")).strip()
+        if not source or not target or not relation:
             continue
-        db.add(Relationship(project_id=project_id, from_character_id=source.id, to_character_id=target.id, relation=str(item.get("relation", "")).strip(), evidence=item.get("evidence")))
+        db.add(Relationship(project_id=project_id, from_character_id=source.id, to_character_id=target.id, relation=relation, evidence=item.get("evidence")))
         created_relationships += 1
 
     episode.analysis = result
@@ -79,5 +80,5 @@ def build_timeline(db: Session, project_id: str) -> list[dict]:
     events = db.scalars(select(Event).where(Event.project_id == project_id).order_by(Event.created_at.asc())).all()
     by_episode: dict[str, list[dict]] = {episode.id: [] for episode in episodes}
     for event in events:
-        by_episode.setdefault(event.episode_id, []).append({"id": event.id, "title": event.title, "evidence": event.evidence, "characters": (event.metadata or {}).get("characters", [])})
+        by_episode.setdefault(event.episode_id, []).append({"id": event.id, "title": event.title, "evidence": event.evidence, "characters": (event.event_metadata or {}).get("characters", [])})
     return [{"episode_id": episode.id, "episode_title": episode.title, "created_at": episode.created_at, "events": by_episode.get(episode.id, [])} for episode in episodes]
