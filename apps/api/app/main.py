@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from collections import Counter
 from datetime import datetime, timezone
@@ -13,11 +14,14 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-app = FastAPI(title="AI Content Review API", version="0.3.0")
+from app.ai_provider import analyze_with_openai
+
+app = FastAPI(title="AI Content Review API", version="0.4.0")
 jobs: dict[str, dict] = {}
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 30
+AI_PROVIDER = os.getenv("AI_PROVIDER", "local").strip().lower()
 
 class AnalyzeRequest(BaseModel):
     title: str = Field(min_length=1, max_length=300)
@@ -36,6 +40,14 @@ def local_analyze(payload: AnalyzeRequest) -> dict:
     if payload.mode == "summary": review = summary
     elif payload.mode == "script": review = f"Mở đầu: {summary}\n\nĐiểm chính: {', '.join(keywords) or 'chưa xác định'}.\n\nKết: Đây là phần cần tiếp tục phân tích khi bật AI provider."
     return {"summary": summary, "review": review, "keywords": keywords, "stats": {"words": len(words), "sentences": len(sentences)}, "provider": "local", "spoiler": payload.spoiler}
+
+def analyze_content(payload: AnalyzeRequest) -> dict:
+    if AI_PROVIDER == "openai":
+        try:
+            return analyze_with_openai(title=payload.title, content=payload.content, mode=payload.mode, spoiler=payload.spoiler)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"AI provider lỗi: {exc}") from exc
+    return local_analyze(payload)
 
 def ocr_image(image: Image.Image) -> str:
     image = ImageOps.exif_transpose(image).convert("RGB")
@@ -73,11 +85,12 @@ def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
     return text, {"type": "image", "pages": 1, "ocr_used": True}
 
 @app.get("/health")
-def health() -> dict: return {"status": "ok", "service": "api", "version": "0.3.0", "ocr": "tesseract", "ai_provider": "local"}
+def health() -> dict:
+    return {"status": "ok", "service": "api", "version": "0.4.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER}
 
 @app.post("/api/v1/analyze")
 def analyze(payload: AnalyzeRequest) -> dict:
-    job_id = str(uuid4()); result = local_analyze(payload)
+    job_id = str(uuid4()); result = analyze_content(payload)
     jobs[job_id] = {"id": job_id, "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "input": payload.model_dump(), "result": result}
     return jobs[job_id]
 
@@ -87,7 +100,7 @@ def analyze_upload(file: UploadFile = File(...), title: str = Form(default="Tài
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     content, source = extract_upload(data, file.filename or "upload")
     payload = AnalyzeRequest(title=title, content=content, mode=mode, spoiler=spoiler)
-    result = local_analyze(payload); result["source"] = source; result["extracted_text"] = content
+    result = analyze_content(payload); result["source"] = source; result["extracted_text"] = content
     job_id = str(uuid4())
     jobs[job_id] = {"id": job_id, "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "input": {"title": title, "mode": mode, "spoiler": spoiler, "filename": file.filename}, "result": result}
     return jobs[job_id]
