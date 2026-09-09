@@ -10,3 +10,4 @@ pytesseract==0.3.13
 openai==1.107.2
 SQLAlchemy==2.0.43
 psycopg[binary]==3.2.9
+redis==6.4.0
