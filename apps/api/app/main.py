@@ -235,7 +235,7 @@ def list_events(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
     if not db.get(Project, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
     events = db.scalars(select(EventModel).where(EventModel.project_id == project_id).order_by(EventModel.created_at.asc())).all()
-    return [{"id": e.id, "episode_id": e.episode_id, "title": e.title, "evidence": e.evidence, "metadata": e.metadata, "created_at": e.created_at} for e in events]
+    return [{"id": e.id, "episode_id": e.episode_id, "title": e.title, "evidence": e.evidence, "metadata": e.event_metadata, "created_at": e.created_at} for e in events]
 
 
 @app.get("/api/v1/projects/{project_id}/relationships")
