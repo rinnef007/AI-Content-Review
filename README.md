@@ -6,8 +6,8 @@ AI-assisted content analysis, summarization, and review-script generation for us
 
 - Project and episode management
 - Text/Markdown input
-- Document/image upload endpoint
-- OCR/AI/STT provider adapters with safe local fallbacks
+- PDF and image upload
+- OCR for Vietnamese + English images and scanned PDFs
 - Structured content analysis
 - Summary and review-script generation
 - Job/status model ready for asynchronous workers
@@ -50,6 +50,17 @@ API: http://localhost:8000
 API docs: http://localhost:8000/docs
 Web: http://localhost:3000
 
-## Current implementation
+## Upload API
 
-The first slice is intentionally provider-agnostic. The API can create analysis jobs and execute deterministic local analysis without an external AI key. Provider adapters can be enabled later through environment variables.
+`POST /api/v1/analyze/upload` accepts `multipart/form-data`:
+
+- `file`: PDF, PNG, JPG/JPEG, WEBP, BMP, TIFF
+- `title`: optional title
+- `mode`: `summary`, `review`, or `script`
+- `spoiler`: boolean
+
+PDFs with a text layer are extracted directly. Scanned/image-only PDFs are rendered page-by-page and OCR'd with Tesseract. V1 limits uploads to 25 MB and 30 PDF pages.
+
+## Current AI behavior
+
+The current analysis provider is intentionally local/deterministic so the complete upload → OCR → analysis flow can be tested without an external API key. The next AI provider layer can replace `local_analyze()` without changing the upload contract.
