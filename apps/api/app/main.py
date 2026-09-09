@@ -34,11 +34,14 @@ async def lifespan(_: FastAPI):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     yield
 
-app = FastAPI(title="AI Content Review API", version="0.9.1", lifespan=lifespan)
-CORS_ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
+app = FastAPI(title="AI Content Review API", version="1.0.0", lifespan=lifespan)
+CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+
+DOCUMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_MEDIA_BYTES = 1024 * 1024 * 1024
 MAX_PDF_PAGES = 30
 AI_PROVIDER = os.getenv("AI_PROVIDER", "local").strip().lower()
 
@@ -99,14 +102,11 @@ def local_analyze(payload: AnalyzeRequest) -> dict:
 
 def analyze_content(payload: AnalyzeRequest) -> dict:
     if AI_PROVIDER == "openai":
-        try:
-            raw = analyze_with_openai(title=payload.title, content=payload.content, mode=payload.mode, spoiler=payload.spoiler)
-            structured = StructuredAnalysis.model_validate(raw)
-            extras = {k: v for k, v in raw.items() if k not in StructuredAnalysis.model_fields}
-            extras["stats"] = {"words": len(payload.content.split()), "sentences": len([s for s in re.split(r"[.!?]+", payload.content) if s.strip()])}
-            return {**structured.model_dump(by_alias=True), **extras}
-        except Exception as exc:
-            raise RuntimeError(f"AI provider lỗi: {exc}") from exc
+        raw = analyze_with_openai(title=payload.title, content=payload.content, mode=payload.mode, spoiler=payload.spoiler)
+        structured = StructuredAnalysis.model_validate(raw)
+        extras = {k: v for k, v in raw.items() if k not in StructuredAnalysis.model_fields}
+        extras["stats"] = {"words": len(payload.content.split()), "sentences": len([s for s in re.split(r"[.!?]+", payload.content) if s.strip()])}
+        return {**structured.model_dump(by_alias=True), **extras}
     return local_analyze(payload)
 
 def ocr_image(image: Image.Image) -> str:
@@ -118,23 +118,22 @@ def extract_pdf(data: bytes) -> tuple[str, int, bool]:
     reader = PdfReader(io.BytesIO(data))
     pages = len(reader.pages)
     if pages > MAX_PDF_PAGES: raise ValueError(f"PDF vượt quá giới hạn {MAX_PDF_PAGES} trang ở V1")
-    text_parts = [(page.extract_text() or "").strip() for page in reader.pages]
-    text = "\n\n".join(p for p in text_parts if p)
+    text = "\n\n".join((page.extract_text() or "").strip() for page in reader.pages if (page.extract_text() or "").strip())
     if text: return text, pages, False
     document = fitz.open(stream=data, filetype="pdf")
     try:
-        ocr_parts: list[str] = []
+        parts = []
         for index, page in enumerate(document):
             pixmap = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False)
             page_text = ocr_image(Image.open(io.BytesIO(pixmap.tobytes("png"))))
-            if page_text: ocr_parts.append(f"[Trang {index + 1}]\n{page_text}")
-        return "\n\n".join(ocr_parts), pages, True
+            if page_text: parts.append(f"[Trang {index + 1}]\n{page_text}")
+        return "\n\n".join(parts), pages, True
     finally:
         document.close()
 
 def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
     suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS: raise ValueError("Chỉ hỗ trợ PDF, PNG, JPEG, WEBP, BMP, TIFF")
+    if suffix not in DOCUMENT_EXTENSIONS: raise ValueError("Chỉ hỗ trợ PDF, JPEG, PNG, WEBP, BMP, TIFF")
     if len(data) > MAX_UPLOAD_BYTES: raise ValueError("File vượt quá giới hạn 25 MB")
     if suffix == ".pdf":
         text, pages, ocr_used = extract_pdf(data)
@@ -148,13 +147,22 @@ def extract_upload(data: bytes, filename: str) -> tuple[str, dict]:
 def project_dict(project: Project) -> dict:
     return {"id": project.id, "name": project.name, "description": project.description, "created_at": project.created_at}
 
+def save_upload(file: UploadFile, limit: int) -> tuple[str, str, int]:
+    filename = Path(file.filename or "upload").name
+    suffix = Path(filename).suffix.lower()
+    data = file.file.read(limit + 1)
+    if len(data) > limit: raise HTTPException(status_code=413, detail=f"File vượt quá giới hạn {limit // (1024 * 1024)} MB")
+    target = UPLOAD_DIR / f"{uuid4().hex}{suffix}"
+    target.write_bytes(data)
+    return str(target), filename, len(data)
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "api", "version": "0.9.1", "ocr": "tesseract", "ai_provider": AI_PROVIDER, "queue": "redis"}
+    return {"status": "ok", "service": "api", "version": "1.0.0", "ocr": "tesseract", "ai_provider": AI_PROVIDER, "queue": "redis", "media": "ffmpeg"}
 
 @app.get("/api/v1/projects")
 def list_projects(db: Session = Depends(get_db)) -> list[dict]:
-    return [project_dict(project) for project in db.scalars(select(Project).order_by(Project.created_at.desc())).all()]
+    return [project_dict(p) for p in db.scalars(select(Project).order_by(Project.created_at.desc())).all()]
 
 @app.post("/api/v1/projects")
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> dict:
@@ -173,30 +181,36 @@ def create_episode(project_id: str, payload: EpisodeCreate, db: Session = Depend
     if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     episode = Episode(project_id=project_id, title=payload.title, content=payload.content, source_type=payload.source_type)
     db.add(episode); db.commit(); db.refresh(episode)
-    return {"id": episode.id, "project_id": episode.project_id, "title": episode.title, "source_type": episode.source_type, "created_at": episode.created_at}
+    return {"id": episode.id, "project_id": project_id, "title": episode.title, "source_type": episode.source_type, "created_at": episode.created_at}
 
 @app.post("/api/v1/projects/{project_id}/episodes/upload")
 def upload_episode(project_id: str, file: UploadFile = File(...), title: str | None = Form(default=None), db: Session = Depends(get_db)) -> dict:
     if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
     filename = Path(file.filename or "upload").name
-    suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS: raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, JPEG, PNG, WEBP, BMP, TIFF")
-    data = file.file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
-    target = UPLOAD_DIR / f"{uuid4().hex}{suffix}"
-    target.write_bytes(data)
+    if Path(filename).suffix.lower() not in DOCUMENT_EXTENSIONS: raise HTTPException(status_code=415, detail="Định dạng tài liệu không được hỗ trợ")
+    path, filename, _ = save_upload(file, MAX_UPLOAD_BYTES)
     episode = Episode(project_id=project_id, title=title or Path(filename).stem, source_type="file", source_filename=filename)
     db.add(episode); db.commit(); db.refresh(episode)
-    job = enqueue({"kind": "upload_episode_analysis", "project_id": project_id, "episode_id": episode.id, "file_path": str(target), "filename": filename, "title": episode.title, "mode": "review", "spoiler": False})
+    job = enqueue({"kind": "upload_episode_analysis", "project_id": project_id, "episode_id": episode.id, "file_path": path, "filename": filename, "title": episode.title, "mode": "review", "spoiler": False})
     return {"episode": {"id": episode.id, "project_id": project_id, "title": episode.title, "source_type": episode.source_type, "source_filename": filename}, "job": job}
+
+@app.post("/api/v1/projects/{project_id}/episodes/media")
+def upload_media_episode(project_id: str, file: UploadFile = File(...), title: str | None = Form(default=None), db: Session = Depends(get_db)) -> dict:
+    if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
+    filename = Path(file.filename or "media").name
+    if Path(filename).suffix.lower() not in MEDIA_EXTENSIONS: raise HTTPException(status_code=415, detail="Chỉ hỗ trợ MP4, MOV, MKV, WEBM, AVI, M4V hoặc audio MP3, WAV, M4A, AAC, FLAC, OGG")
+    path, filename, size = save_upload(file, MAX_MEDIA_BYTES)
+    episode = Episode(project_id=project_id, title=title or Path(filename).stem, source_type="video" if Path(filename).suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"} else "audio", source_filename=filename)
+    db.add(episode); db.commit(); db.refresh(episode)
+    job = enqueue({"kind": "media_episode_analysis", "project_id": project_id, "episode_id": episode.id, "file_path": path, "filename": filename, "title": episode.title})
+    return {"episode": {"id": episode.id, "project_id": project_id, "title": episode.title, "source_type": episode.source_type, "source_filename": filename, "size": size}, "job": job}
 
 @app.post("/api/v1/projects/{project_id}/episodes/{episode_id}/analyze")
 def analyze_episode(project_id: str, episode_id: str, db: Session = Depends(get_db)) -> dict:
     episode = db.get(Episode, episode_id)
     if not episode or episode.project_id != project_id: raise HTTPException(status_code=404, detail="Episode not found")
     if not episode.content: raise HTTPException(status_code=422, detail="Episode chưa có nội dung")
-    job = enqueue({"kind": "episode_analysis", "project_id": project_id, "episode_id": episode_id, "title": episode.title, "content": episode.content, "mode": "review", "spoiler": False})
-    return {"job": job, "episode_id": episode_id}
+    return {"job": enqueue({"kind": "episode_analysis", "project_id": project_id, "episode_id": episode_id, "title": episode.title, "content": episode.content, "mode": "review", "spoiler": False}), "episode_id": episode_id}
 
 @app.post("/api/v1/jobs")
 def create_analysis_job(payload: AnalyzeRequest) -> dict:
@@ -211,14 +225,12 @@ def get_analysis_job(job_id: str) -> dict:
 @app.get("/api/v1/projects/{project_id}/characters")
 def list_characters(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
     if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
-    characters = db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id).order_by(CharacterModel.name.asc())).all()
-    return [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases, "created_at": c.created_at} for c in characters]
+    return [{"id": c.id, "name": c.name, "role": c.role, "aliases": c.aliases, "created_at": c.created_at} for c in db.scalars(select(CharacterModel).where(CharacterModel.project_id == project_id).order_by(CharacterModel.name.asc())).all()]
 
 @app.get("/api/v1/projects/{project_id}/events")
 def list_events(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
     if not db.get(Project, project_id): raise HTTPException(status_code=404, detail="Project not found")
-    events = db.scalars(select(EventModel).where(EventModel.project_id == project_id).order_by(EventModel.created_at.asc())).all()
-    return [{"id": e.id, "episode_id": e.episode_id, "title": e.title, "evidence": e.evidence, "metadata": e.event_metadata, "created_at": e.created_at} for e in events]
+    return [{"id": e.id, "episode_id": e.episode_id, "title": e.title, "evidence": e.evidence, "metadata": e.event_metadata, "created_at": e.created_at} for e in db.scalars(select(EventModel).where(EventModel.project_id == project_id).order_by(EventModel.created_at.asc())).all()]
 
 @app.get("/api/v1/projects/{project_id}/relationships")
 def list_relationships(project_id: str, db: Session = Depends(get_db)) -> list[dict]:
@@ -239,11 +251,7 @@ def analyze(payload: AnalyzeRequest) -> dict:
 @app.post("/api/v1/analyze/upload")
 def analyze_upload(file: UploadFile = File(...), title: str = Form(default="Tài liệu tải lên"), mode: str = Form(default="review"), spoiler: bool = Form(default=False)) -> dict:
     if mode not in {"summary", "review", "script"}: raise HTTPException(status_code=422, detail="mode phải là summary, review hoặc script")
-    data = file.file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB")
     filename = Path(file.filename or "upload").name
-    suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS: raise HTTPException(status_code=415, detail="Chỉ hỗ trợ PDF, JPEG, PNG, WEBP, BMP, TIFF")
-    target = UPLOAD_DIR / f"{uuid4().hex}{suffix}"
-    target.write_bytes(data)
-    return enqueue({"kind": "upload_analysis", "file_path": str(target), "filename": filename, "title": title, "mode": mode, "spoiler": spoiler})
+    if Path(filename).suffix.lower() not in DOCUMENT_EXTENSIONS: raise HTTPException(status_code=415, detail="Định dạng tài liệu không được hỗ trợ")
+    path, filename, _ = save_upload(file, MAX_UPLOAD_BYTES)
+    return enqueue({"kind": "upload_analysis", "file_path": path, "filename": filename, "title": title, "mode": mode, "spoiler": spoiler})
